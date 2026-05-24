@@ -277,6 +277,7 @@ static void mqtt_init(void)
 }
 
 static void mqtt_publish_result(uint32_t touch_time_ms,
+                                const uint8_t touched[3],
                                 const uint8_t mask[OUTPUT_COUNT],
                                 uint32_t duration_ms, uint32_t pause_ms)
 {
@@ -289,11 +290,17 @@ static void mqtt_publish_result(uint32_t touch_time_ms,
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "touch_time_ms", touch_time_ms);
 
+    cJSON *jtouched = cJSON_CreateArray();
+    for (int i = 0; i < 3; i++) {
+        cJSON_AddItemToArray(jtouched, cJSON_CreateNumber(touched[i]));
+    }
+    cJSON_AddItemToObject(root, "touched", jtouched);
+
     cJSON *jmask = cJSON_CreateArray();
     for (int i = 0; i < OUTPUT_COUNT; i++) {
         cJSON_AddItemToArray(jmask, cJSON_CreateNumber(mask[i]));
     }
-    cJSON_AddItemToObject(root, "mask", jmask);
+    cJSON_AddItemToObject(root, "outputs", jmask);
     cJSON_AddNumberToObject(root, "duration_ms", duration_ms);
     cJSON_AddNumberToObject(root, "pause_ms", pause_ms);
 
@@ -425,7 +432,11 @@ void app_main(void)
             outputs_stop();
             uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - touch_start) / 1000);
             ESP_LOGI(TAG, "\033[32mALL OFF — touch held %" PRIu32 " ms\033[0m", elapsed_ms);
-            mqtt_publish_result(elapsed_ms, last_mask, last_duration_ms, last_pause_ms);
+            uint8_t touched[TOUCH_CHANNEL_COUNT];
+            for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
+                touched[i] = ch_active[i] ? 1 : 0;
+            }
+            mqtt_publish_result(elapsed_ms, touched, last_mask, last_duration_ms, last_pause_ms);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");
