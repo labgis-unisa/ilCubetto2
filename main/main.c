@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <inttypes.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/touch_sens.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -17,7 +19,68 @@ static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
     GPIO_NUM_9,
 };
 
-#define OUTPUT_PULSE_MS 300
+#define OUTPUT_PULSE_MS  300
+#define OUTPUT_PAUSE_MS  500
+
+typedef struct {
+    uint8_t  mask[OUTPUT_COUNT];
+    uint32_t duration_ms;
+    bool     pending;
+    bool     active;        /* true while pulse_task is driving the outputs */
+} pulse_request_t;
+
+static SemaphoreHandle_t   s_pulse_mutex;
+static pulse_request_t     s_pulse_req;
+static TaskHandle_t        s_pulse_task;
+
+static void outputs_all_off(void)
+{
+    for (int i = 0; i < OUTPUT_COUNT; i++) {
+        gpio_set_level(output_gpios[i], 0);
+    }
+}
+
+static void pulse_task(void *arg)
+{
+    while (1) {
+        /* Wait until a request arrives */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
+        uint8_t  mask[OUTPUT_COUNT];
+        uint32_t duration_ms;
+        memcpy(mask, s_pulse_req.mask, OUTPUT_COUNT);
+        duration_ms         = s_pulse_req.duration_ms;
+        s_pulse_req.pending = false;
+        s_pulse_req.active  = true;
+        xSemaphoreGive(s_pulse_mutex);
+
+        /* Activate outputs */
+        ESP_LOGI(TAG, "OUT ON  [%d %d %d] dur=%" PRIu32 "ms",
+                 mask[0], mask[1], mask[2], duration_ms);
+        for (int i = 0; i < OUTPUT_COUNT; i++) {
+            gpio_set_level(output_gpios[i], mask[i] ? 1 : 0);
+        }
+
+        /* Wait up to duration_ms; a new notification cancels the pulse early */
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(duration_ms));
+
+        xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
+        s_pulse_req.active = false;
+        xSemaphoreGive(s_pulse_mutex);
+
+        outputs_all_off();
+        ESP_LOGI(TAG, "OUT OFF [0 0 0]%s", notified ? " (cancelled)" : "");
+
+        if (notified) {
+            /* New request arrived during pulse — re-queue it */
+            xTaskNotifyGive(s_pulse_task);
+        }
+
+        /* Mandatory pause between activations */
+        vTaskDelay(pdMS_TO_TICKS(OUTPUT_PAUSE_MS));
+    }
+}
 
 static void outputs_init(void)
 {
@@ -26,6 +89,9 @@ static void outputs_init(void)
         gpio_set_direction(output_gpios[i], GPIO_MODE_OUTPUT);
         gpio_set_level(output_gpios[i], 0);
     }
+
+    s_pulse_mutex = xSemaphoreCreateMutex();
+    xTaskCreate(pulse_task, "pulse", 4096, NULL, 5, &s_pulse_task);
 }
 
 static void outputs_pulse(const uint8_t mask[OUTPUT_COUNT], uint32_t duration_ms)
@@ -33,12 +99,18 @@ static void outputs_pulse(const uint8_t mask[OUTPUT_COUNT], uint32_t duration_ms
     if (duration_ms == 0) {
         duration_ms = OUTPUT_PULSE_MS;
     }
-    for (int i = 0; i < OUTPUT_COUNT; i++) {
-        gpio_set_level(output_gpios[i], mask[i] ? 1 : 0);
-    }
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    for (int i = 0; i < OUTPUT_COUNT; i++) {
-        gpio_set_level(output_gpios[i], 0);
+
+    xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
+    bool same_mask = s_pulse_req.active &&
+                     memcmp(s_pulse_req.mask, mask, OUTPUT_COUNT) == 0;
+    memcpy(s_pulse_req.mask, mask, OUTPUT_COUNT);
+    s_pulse_req.duration_ms = duration_ms;
+    s_pulse_req.pending     = true;
+    xSemaphoreGive(s_pulse_mutex);
+
+    /* Don't interrupt a running pulse if the mask hasn't changed */
+    if (!same_mask) {
+        xTaskNotifyGive(s_pulse_task);
     }
 }
 
@@ -54,35 +126,6 @@ static const int touch_chan_ids[TOUCH_CHANNEL_COUNT] = {4, 5, 6};
 
 static touch_sensor_handle_t  s_sens_handle;
 static touch_channel_handle_t s_chan_handle[TOUCH_CHANNEL_COUNT];
-static volatile bool s_chan_active[TOUCH_CHANNEL_COUNT];
-static volatile int  s_active_index = -1;
-
-static bool touch_on_active_cb(touch_sensor_handle_t sens_handle,
-                               const touch_active_event_data_t *event,
-                               void *user_ctx)
-{
-    for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
-        if (touch_chan_ids[i] == (int)event->chan_id) {
-            s_chan_active[i] = true;
-            s_active_index   = i;
-            break;
-        }
-    }
-    return false;
-}
-
-static bool touch_on_inactive_cb(touch_sensor_handle_t sens_handle,
-                                 const touch_inactive_event_data_t *event,
-                                 void *user_ctx)
-{
-    for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
-        if (touch_chan_ids[i] == (int)event->chan_id) {
-            s_chan_active[i] = false;
-            break;
-        }
-    }
-    return false;
-}
 
 static void touch_initial_scanning(void)
 {
@@ -129,12 +172,6 @@ void app_main(void)
     ESP_ERROR_CHECK(touch_sensor_config_filter(s_sens_handle, &filter_cfg));
 
     touch_initial_scanning();
-
-    touch_event_callbacks_t callbacks = {
-        .on_active   = touch_on_active_cb,
-        .on_inactive = touch_on_inactive_cb,
-    };
-    ESP_ERROR_CHECK(touch_sensor_register_callbacks(s_sens_handle, &callbacks, NULL));
 
     ESP_ERROR_CHECK(touch_sensor_enable(s_sens_handle));
     ESP_ERROR_CHECK(touch_sensor_start_continuous_scanning(s_sens_handle));
