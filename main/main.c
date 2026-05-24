@@ -24,9 +24,8 @@ static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
 /* ---------- Current command ---------- */
 static SemaphoreHandle_t s_cmd_mutex;
 static mqtt_cmd_t s_cmd = {
-    .mask        = {1, 1, 1},
-    .duration_ms = 300,
-    .pause_ms    = 500,
+    .pulse_ms = {300, 300, 300},
+    .pause_ms = 500,
 };
 
 /* ---------- Pulse task ---------- */
@@ -36,8 +35,7 @@ static mqtt_cmd_t s_cmd = {
 static SemaphoreHandle_t s_pulse_mutex;
 static TaskHandle_t      s_pulse_task;
 
-static uint8_t  s_pulse_mask[OUTPUT_COUNT];
-static uint32_t s_pulse_duration_ms;
+static uint32_t s_pulse_ms[OUTPUT_COUNT]; /* per-output pulse duration; 0 = off */
 static uint32_t s_pulse_pause_ms;
 
 static void outputs_all_off(void)
@@ -56,24 +54,48 @@ static void pulse_task(void *arg)
         } while (note != PULSE_NOTIFY_START);
 
         xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
-        uint8_t  mask[OUTPUT_COUNT];
-        uint32_t duration_ms = s_pulse_duration_ms;
-        uint32_t pause_ms    = s_pulse_pause_ms;
-        memcpy(mask, s_pulse_mask, OUTPUT_COUNT);
+        uint32_t pulse_ms[OUTPUT_COUNT];
+        uint32_t pause_ms = s_pulse_pause_ms;
+        memcpy(pulse_ms, s_pulse_ms, sizeof(s_pulse_ms));
         xSemaphoreGive(s_pulse_mutex);
 
         while (1) {
-            ESP_LOGI(TAG, "OUT ON  [%d %d %d] dur=%" PRIu32 "ms",
-                     mask[0], mask[1], mask[2], duration_ms);
+            ESP_LOGI(TAG, "OUT ON  pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]",
+                     pulse_ms[0], pulse_ms[1], pulse_ms[2]);
+
+            /* Activate outputs that have a non-zero pulse duration */
             for (int i = 0; i < OUTPUT_COUNT; i++) {
-                gpio_set_level(output_gpios[i], mask[i] ? 1 : 0);
+                gpio_set_level(output_gpios[i], pulse_ms[i] > 0 ? 1 : 0);
             }
 
-            xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(duration_ms));
+            /* Turn off each output after its individual pulse duration */
+            uint32_t elapsed = 0;
+            bool stopped = false;
+            while (elapsed < UINT32_MAX) {
+                /* Find the next output to turn off */
+                uint32_t next_off = UINT32_MAX;
+                for (int i = 0; i < OUTPUT_COUNT; i++) {
+                    if (pulse_ms[i] > elapsed && pulse_ms[i] < next_off) {
+                        next_off = pulse_ms[i];
+                    }
+                }
+                if (next_off == UINT32_MAX) break; /* all already off */
+
+                uint32_t wait = next_off - elapsed;
+                xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(wait));
+                if (note == PULSE_NOTIFY_STOP) { stopped = true; break; }
+                elapsed = next_off;
+
+                for (int i = 0; i < OUTPUT_COUNT; i++) {
+                    if (pulse_ms[i] <= elapsed) {
+                        gpio_set_level(output_gpios[i], 0);
+                    }
+                }
+            }
             outputs_all_off();
             ESP_LOGI(TAG, "OUT OFF [0 0 0]");
 
-            if (note == PULSE_NOTIFY_STOP) break;
+            if (stopped) break;
 
             xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(pause_ms));
             if (note == PULSE_NOTIFY_STOP) break;
@@ -93,12 +115,11 @@ static void outputs_init(void)
     xTaskCreate(pulse_task, "pulse", 4096, NULL, 5, &s_pulse_task);
 }
 
-static void outputs_start(const uint8_t mask[OUTPUT_COUNT], uint32_t duration_ms, uint32_t pause_ms)
+static void outputs_start(const uint32_t pulse_ms[OUTPUT_COUNT], uint32_t pause_ms)
 {
     xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
-    memcpy(s_pulse_mask, mask, OUTPUT_COUNT);
-    s_pulse_duration_ms = duration_ms;
-    s_pulse_pause_ms    = pause_ms;
+    memcpy(s_pulse_ms, pulse_ms, sizeof(s_pulse_ms));
+    s_pulse_pause_ms = pause_ms;
     xSemaphoreGive(s_pulse_mutex);
 
     xTaskNotify(s_pulse_task, PULSE_NOTIFY_START, eSetValueWithOverwrite);
@@ -178,11 +199,10 @@ void app_main(void)
     ESP_ERROR_CHECK(touch_sensor_start_continuous_scanning(s_sens_handle));
     ESP_LOGI(TAG, "Touch sensor running");
 
-    bool     all_active      = false;
-    int64_t  touch_start     = 0;
-    uint8_t  last_mask[OUTPUT_COUNT] = {};
-    uint32_t last_duration_ms = 0;
-    uint32_t last_pause_ms    = 0;
+    bool     all_active           = false;
+    int64_t  touch_start          = 0;
+    uint32_t last_pulse_ms[OUTPUT_COUNT] = {};
+    uint32_t last_pause_ms        = 0;
 
     while (1) {
         uint32_t data[TOUCH_SAMPLE_CFG_NUM] = {};
@@ -207,13 +227,13 @@ void app_main(void)
             touch_start = esp_timer_get_time();
 
             xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
-            memcpy(last_mask, s_cmd.mask, OUTPUT_COUNT);
-            last_duration_ms = s_cmd.duration_ms;
-            last_pause_ms    = s_cmd.pause_ms;
+            memcpy(last_pulse_ms, s_cmd.pulse_ms, sizeof(s_cmd.pulse_ms));
+            last_pause_ms = s_cmd.pause_ms;
             xSemaphoreGive(s_cmd_mutex);
 
-            ESP_LOGI(TAG, "\033[32mALL ON — starting output cycle\033[0m");
-            outputs_start(last_mask, last_duration_ms, last_pause_ms);
+            ESP_LOGI(TAG, "\033[32mALL ON — pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] pause=%" PRIu32 "ms\033[0m",
+                     last_pulse_ms[0], last_pulse_ms[1], last_pulse_ms[2], last_pause_ms);
+            outputs_start(last_pulse_ms, last_pause_ms);
 
         } else if (!all_now && all_active) {
             all_active = false;
@@ -225,7 +245,7 @@ void app_main(void)
             for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
                 touched[i] = ch_active[i] ? 1 : 0;
             }
-            mqtt_publish_result(elapsed_ms, touched, last_mask, last_duration_ms, last_pause_ms);
+            mqtt_publish_result(elapsed_ms, touched, last_pulse_ms, last_pause_ms);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");
