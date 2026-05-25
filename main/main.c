@@ -24,8 +24,8 @@ static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
 /* ---------- Current command ---------- */
 static SemaphoreHandle_t s_cmd_mutex;
 static mqtt_cmd_t s_cmd = {
-    .pulse_ms = {300, 300, 300},
-    .pause_ms = 500,
+    .pulse_ms = {0, 0, 0},
+    .pause_ms = 2000,
 };
 
 /* ---------- Pulse task ---------- */
@@ -137,6 +137,7 @@ static const int touch_chan_ids[TOUCH_CHANNEL_COUNT] = {4, 5, 6};
 
 static touch_sensor_handle_t  s_sens_handle;
 static touch_channel_handle_t s_chan_handle[TOUCH_CHANNEL_COUNT];
+static uint32_t s_channel_thresh[TOUCH_CHANNEL_COUNT] = {};
 
 static void touch_initial_scanning(void)
 {
@@ -150,14 +151,19 @@ static void touch_initial_scanning(void)
         uint32_t benchmark[TOUCH_SAMPLE_CFG_NUM] = {};
         ESP_ERROR_CHECK(touch_channel_read_data(s_chan_handle[i],
                         TOUCH_CHAN_DATA_TYPE_BENCHMARK, benchmark));
+        /* Compute adaptive threshold from benchmark to avoid fixed literals */
+        uint32_t thresh = benchmark[0] + (benchmark[0] / 8); /* +12.5% margin */
+        if (thresh < 1000) thresh = 1000;
+        if (thresh > 60000) thresh = 60000;
         touch_channel_config_t cfg = {
-            .active_thresh    = {48000},
+            .active_thresh    = {thresh},
             .charge_speed     = TOUCH_CHARGE_SPEED_7,
             .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
         };
         ESP_ERROR_CHECK(touch_sensor_reconfig_channel(s_chan_handle[i], &cfg));
+        s_channel_thresh[i] = cfg.active_thresh[0];
         ESP_LOGI(TAG, "CH%d benchmark=%" PRIu32 " threshold=%" PRIu32,
-                 touch_chan_ids[i], benchmark[0], cfg.active_thresh[0]);
+                 touch_chan_ids[i], benchmark[0], s_channel_thresh[i]);
     }
 }
 
@@ -210,11 +216,11 @@ void app_main(void)
 
         for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
             touch_channel_read_data(s_chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, data);
-            ch_active[i] = (data[0] > 48000);
-            ESP_LOGI(TAG, "CH%d: %s value=%" PRIu32,
+            ch_active[i] = (data[0] > s_channel_thresh[i]);
+            ESP_LOGI(TAG, "CH%d: %s value=%" PRIu32 " thresh=%" PRIu32,
                      touch_chan_ids[i],
                      ch_active[i] ? "\033[31mON\033[0m" : "OFF",
-                     data[0]);
+                     data[0], s_channel_thresh[i]);
         }
 
         bool all_now = true;
