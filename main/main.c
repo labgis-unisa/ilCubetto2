@@ -27,6 +27,7 @@ static mqtt_cmd_t s_cmd = {
     .pulse_ms = {0, 0, 0},
     .pause_ms = 2000,
 };
+static bool is_new_cmd = false;
 
 /* ---------- Pulse task ---------- */
 #define PULSE_NOTIFY_START 1
@@ -176,7 +177,7 @@ void app_main(void)
     outputs_init();
 
     s_cmd_mutex = xSemaphoreCreateMutex();
-    mqtt_init(&s_cmd, s_cmd_mutex);
+    mqtt_init(&s_cmd, s_cmd_mutex, &is_new_cmd);
 
     /* Touch sensor setup */
     touch_sensor_sample_config_t sample_cfg[TOUCH_SAMPLE_CFG_NUM] = {
@@ -235,6 +236,7 @@ void app_main(void)
             xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
             memcpy(last_pulse_ms, s_cmd.pulse_ms, sizeof(s_cmd.pulse_ms));
             last_pause_ms = s_cmd.pause_ms;
+            is_new_cmd = false;
             xSemaphoreGive(s_cmd_mutex);
 
             ESP_LOGI(TAG, "\033[32mALL ON — pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] pause=%" PRIu32 "ms\033[0m",
