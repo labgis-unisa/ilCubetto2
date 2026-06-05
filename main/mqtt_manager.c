@@ -14,6 +14,7 @@ static esp_mqtt_client_handle_t s_client;
 
 static mqtt_cmd_t       *s_cmd;
 static SemaphoreHandle_t s_cmd_mutex;
+static bool             *s_is_new_cmd_ptr;
 
 static SemaphoreHandle_t s_last_json_mutex;
 static char              s_last_json[256];
@@ -51,12 +52,16 @@ static void handle_command(const char *payload, int len)
     ESP_LOGI(TAG, "cmd after update: pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] pause=%" PRIu32 "ms",
              s_cmd->pulse_ms[0], s_cmd->pulse_ms[1], s_cmd->pulse_ms[2],
              s_cmd->pause_ms);
+    *s_is_new_cmd_ptr = true;
     xSemaphoreGive(s_cmd_mutex);
 
     xSemaphoreTake(s_last_json_mutex, portMAX_DELAY);
     strncpy(s_last_json, buf, sizeof(s_last_json) - 1);
     s_last_json[sizeof(s_last_json) - 1] = '\0';
     xSemaphoreGive(s_last_json_mutex);
+
+    esp_mqtt_client_publish(s_client, MQTT_TOPIC_READY, "{\"status\":\"ready\"}", 0, 1, 0);
+    ESP_LOGI(TAG, "pub " MQTT_TOPIC_READY " -> ready");
 
     cJSON_Delete(root);
 }
@@ -69,6 +74,8 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected");
         esp_mqtt_client_subscribe(s_client, MQTT_TOPIC_CMD, 1);
+        esp_mqtt_client_publish(s_client, MQTT_TOPIC_ONLINE, "{\"status\":\"online\"}", 0, 1, 0);
+        ESP_LOGI(TAG, "pub " MQTT_TOPIC_ONLINE " -> online");
         break;
     case MQTT_EVENT_DATA:
         if (strncmp(event->topic, MQTT_TOPIC_CMD, event->topic_len) == 0) {
@@ -83,15 +90,18 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex)
+void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr)
 {
     s_cmd             = cmd;
     s_cmd_mutex       = (SemaphoreHandle_t)cmd_mutex;
+    s_is_new_cmd_ptr  = is_new_cmd_ptr;
     s_last_json_mutex = xSemaphoreCreateMutex();
     s_last_json[0]    = '\0';
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
+        // .credentials.username = "user",
+        // .credentials.authentication.password = "password",
     };
     s_client = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,

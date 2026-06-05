@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdbool.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -13,6 +15,12 @@
 #include "mqtt_manager.h"
 
 #define TAG "TOUCH"
+
+/* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
+#define DEBUG_SINGLE_FINGER 0
+
+/* After this many ms of pulsing, hold outputs continuously ON to stabilise temperature */
+#define STABILIZE_AFTER_MS 5000
 
 /* ---------- Output GPIOs ---------- */
 static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
@@ -27,10 +35,17 @@ static mqtt_cmd_t s_cmd = {
     .pulse_ms = {0, 0, 0},
     .pause_ms = 2000,
 };
+static bool is_new_cmd = false;
 
 /* ---------- Pulse task ---------- */
 #define PULSE_NOTIFY_START 1
 #define PULSE_NOTIFY_STOP  2
+
+/* Number of pulse cycles over which the pause ramps up logarithmically 
+Higher values make the pause ramp more gradually, but also mean it takes longer to reach the full pause duration.
+Lower values make the pause ramp more quickly, but may cause a more abrupt change in pause duration between cycles.
+*/
+#define RAMP_CYCLES 8
 
 static SemaphoreHandle_t s_pulse_mutex;
 static TaskHandle_t      s_pulse_task;
@@ -59,7 +74,17 @@ static void pulse_task(void *arg)
         memcpy(pulse_ms, s_pulse_ms, sizeof(s_pulse_ms));
         xSemaphoreGive(s_pulse_mutex);
 
+        int64_t run_start_us = esp_timer_get_time();
+        uint32_t cycle = 0;
         while (1) {
+            /* ---- stabilise phase: once STABILIZE_AFTER_MS has elapsed, lock the
+               ramp at full pause_ms so average power stays constant.
+               Constant average power → thermal equilibrium (temperature plateaus). ---- */
+            bool stabilised = (esp_timer_get_time() - run_start_us) >= (int64_t)STABILIZE_AFTER_MS * 1000;
+            if (stabilised && cycle <= RAMP_CYCLES) {
+                cycle = RAMP_CYCLES; /* skip remaining ramp steps */
+                ESP_LOGI(TAG, "\033[33mSTABLE — fixed duty cycle, pause=%" PRIu32 "ms\033[0m", pause_ms);
+            }
             ESP_LOGI(TAG, "OUT ON  pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]",
                      pulse_ms[0], pulse_ms[1], pulse_ms[2]);
 
@@ -97,7 +122,18 @@ static void pulse_task(void *arg)
 
             if (stopped) break;
 
-            xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(pause_ms));
+            /* Log ramp: pause grows from ~0 ms to pause_ms over RAMP_CYCLES cycles */
+            uint32_t current_pause;
+            if (cycle < RAMP_CYCLES && pause_ms > 0) {
+                float t = log2f((float)(cycle + 1)) / log2f((float)(RAMP_CYCLES + 1));
+                current_pause = (uint32_t)(pause_ms * t);
+            } else {
+                current_pause = pause_ms;
+            }
+            ESP_LOGI(TAG, "PAUSE %" PRIu32 "ms (ramp cycle %" PRIu32 ")", current_pause, cycle);
+            cycle++;
+
+            xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(current_pause));
             if (note == PULSE_NOTIFY_STOP) break;
         }
     }
@@ -176,7 +212,7 @@ void app_main(void)
     outputs_init();
 
     s_cmd_mutex = xSemaphoreCreateMutex();
-    mqtt_init(&s_cmd, s_cmd_mutex);
+    mqtt_init(&s_cmd, s_cmd_mutex, &is_new_cmd);
 
     /* Touch sensor setup */
     touch_sensor_sample_config_t sample_cfg[TOUCH_SAMPLE_CFG_NUM] = {
@@ -223,22 +259,32 @@ void app_main(void)
                      data[0], s_channel_thresh[i]);
         }
 
+#if DEBUG_SINGLE_FINGER
+        /* Debug mode: any single finger is enough to start */
+        bool all_now = false;
+        for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
+            if (ch_active[i]) { all_now = true; break; }
+        }
+#else
         bool all_now = true;
         for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
             if (!ch_active[i]) { all_now = false; break; }
         }
+#endif
 
-        if (all_now && !all_active) {
+        if (all_now && !all_active && is_new_cmd) {
             all_active  = true;
             touch_start = esp_timer_get_time();
 
             xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
             memcpy(last_pulse_ms, s_cmd.pulse_ms, sizeof(s_cmd.pulse_ms));
             last_pause_ms = s_cmd.pause_ms;
+            is_new_cmd = false;
             xSemaphoreGive(s_cmd_mutex);
 
             ESP_LOGI(TAG, "\033[32mALL ON — pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] pause=%" PRIu32 "ms\033[0m",
                      last_pulse_ms[0], last_pulse_ms[1], last_pulse_ms[2], last_pause_ms);
+            ESP_LOGI(TAG, "\033[32m---------Starting outputs...\033[0m");
             outputs_start(last_pulse_ms, last_pause_ms);
 
         } else if (!all_now && all_active) {
