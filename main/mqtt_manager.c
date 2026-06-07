@@ -1,5 +1,6 @@
 #include "mqtt_manager.h"
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
@@ -140,7 +141,7 @@ void mqtt_publish_result(uint32_t touch_time_ms,
 
     cJSON *jtemps = cJSON_CreateArray();
     for (int i = 0; i < NTC_COUNT; i++) {
-        cJSON_AddItemToArray(jtemps, cJSON_CreateNumber((double)temps_c[i]));
+        cJSON_AddItemToArray(jtemps, cJSON_CreateNumber(roundf(temps_c[i] * 10.0f) / 10.0f));
     }
     cJSON_AddItemToObject(root, "temps_c", jtemps);
 

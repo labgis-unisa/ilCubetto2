@@ -35,12 +35,15 @@ static const adc_channel_t s_ntc_channels[NTC_COUNT] = {
     ADC_CHANNEL_0,  /* GPIO1 MEDIO*/
 };
 
-/* Per-channel calibration offsets (°C to subtract), measured vs thermocouple reference */
-static const float s_ntc_offset_c[NTC_COUNT] = {
+/* Per-channel calibration offsets (°C).
+   s_ntc_offset_fixed: measured vs thermocouple reference (hardware trim).
+   s_ntc_offset_dyn:   computed at startup so all channels read the same initial value. */
+static const float s_ntc_offset_fixed[NTC_COUNT] = {
     20.8f,  /* GPIO2 */
     20.8f,  /* GPIO3 */
     20.8f,  /* GPIO1 */
 };
+static float s_ntc_offset_dyn[NTC_COUNT] = {0.0f, 0.0f, 0.0f};
 
 static adc_oneshot_unit_handle_t s_adc_handle;
 
@@ -71,6 +74,7 @@ static float ntc_raw_to_celsius(int raw, float offset_c)
        1/T = 1/T0 + (1/B) * ln(R/R0)   [T in Kelvin] */
     float t_kelvin = 1.0f / (1.0f / (NTC_NOMINAL_T + 273.15f)
                              + logf(r_ntc / NTC_NOMINAL_R) / NTC_BETA);
+    /* offset_c combines the fixed hardware trim and the dynamic inter-channel equalisation */
     return t_kelvin - 273.15f - offset_c;
 }
 
@@ -86,7 +90,8 @@ static void ntc_read_all(float out_celsius[NTC_COUNT])
             ESP_ERROR_CHECK(adc_oneshot_read(s_adc_handle, s_ntc_channels[i], &raw));
             sum += raw;
         }
-        float t = ntc_raw_to_celsius((int)(sum / NTC_OVERSAMPLE), s_ntc_offset_c[i]);
+        float t = ntc_raw_to_celsius((int)(sum / NTC_OVERSAMPLE),
+                                     s_ntc_offset_fixed[i] + s_ntc_offset_dyn[i]);
         if (t >= NTC_MIN_VALID_C) {
             s_ntc_last_valid[i] = t;
         } else {
@@ -289,17 +294,47 @@ static void touch_initial_scanning(void)
     }
 }
 
+/* ---------- NTC dynamic calibration ---------- */
+/* Take NTC_CAL_SAMPLES averaged readings, then shift every channel by the
+   same offset so they all report the mean of their initial temperatures.
+   This removes inter-channel bias without altering the absolute scale
+   (the fixed hardware offsets in s_ntc_offset_fixed still anchor accuracy). */
+#define NTC_CAL_SAMPLES 32
+
+static void ntc_calibrate(void)
+{
+    float sums[NTC_COUNT] = {0.0f};
+
+    for (int s = 0; s < NTC_CAL_SAMPLES; s++) {
+        float t[NTC_COUNT];
+        ntc_read_all(t);
+        for (int i = 0; i < NTC_COUNT; i++) sums[i] += t[i];
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    float means[NTC_COUNT];
+    float grand_mean = 0.0f;
+    for (int i = 0; i < NTC_COUNT; i++) {
+        means[i]   = sums[i] / NTC_CAL_SAMPLES;
+        grand_mean += means[i];
+    }
+    grand_mean /= NTC_COUNT;
+
+    for (int i = 0; i < NTC_COUNT; i++) {
+        /* positive offset → subtract → lowers the reading of hotter channels */
+        s_ntc_offset_dyn[i] = means[i] - grand_mean;
+        ESP_LOGI(TAG, "NTC[%d] cal mean=%.2f °C  dyn_offset=%+.2f °C",
+                 i, means[i], s_ntc_offset_dyn[i]);
+    }
+    ESP_LOGI(TAG, "NTC calibration done — target=%.2f °C", grand_mean);
+}
+
 /* ---------- Main ---------- */
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ntc_init();
-    wifi_init();
-
-    outputs_init();
-
-    s_cmd_mutex = xSemaphoreCreateMutex();
-    mqtt_init(&s_cmd, s_cmd_mutex, &is_new_cmd);
+    ntc_calibrate();
 
     /* Touch sensor setup */
     touch_sensor_sample_config_t sample_cfg[TOUCH_SAMPLE_CFG_NUM] = {
@@ -326,17 +361,25 @@ void app_main(void)
 
     ESP_ERROR_CHECK(touch_sensor_enable(s_sens_handle));
     ESP_ERROR_CHECK(touch_sensor_start_continuous_scanning(s_sens_handle));
+
+    wifi_init();
+
+    outputs_init();
+
+    s_cmd_mutex = xSemaphoreCreateMutex();
+    mqtt_init(&s_cmd, s_cmd_mutex, &is_new_cmd);
     ESP_LOGI(TAG, "Touch sensor running");
 
     bool     all_active           = false;
     int64_t  touch_start          = 0;
     uint32_t last_pulse_ms[OUTPUT_COUNT] = {};
     uint32_t last_pause_ms        = 0;
+    float    temp_max[NTC_COUNT]  = {};
 
     while (1) {
         float temps_c[NTC_COUNT];
         ntc_read_all(temps_c);
-        ESP_LOGI(TAG, "NTC temp: GPIO1=%.1f °C  GPIO2=%.1f °C  GPIO3=%.1f °C",
+        ESP_LOGI(TAG, "NTC temp: GPIO2=%.1f °C  GPIO3=%.1f °C  GPIO1=%.1f °C",
                  temps_c[0], temps_c[1], temps_c[2]);
 
         uint32_t data[TOUCH_SAMPLE_CFG_NUM] = {};
@@ -368,9 +411,16 @@ void app_main(void)
         }
 #endif
 
+        if (all_active) {
+            for (int i = 0; i < NTC_COUNT; i++) {
+                if (temps_c[i] > temp_max[i]) temp_max[i] = temps_c[i];
+            }
+        }
+
         if (all_now && !all_active && is_new_cmd) {
             all_active  = true;
             touch_start = esp_timer_get_time();
+            for (int i = 0; i < NTC_COUNT; i++) temp_max[i] = temps_c[i];
 
             xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
             memcpy(last_pulse_ms, s_cmd.pulse_ms, sizeof(s_cmd.pulse_ms));
@@ -393,7 +443,7 @@ void app_main(void)
             for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
                 touched[i] = ch_active[i] ? 1 : 0;
             }
-            mqtt_publish_result(elapsed_ms, touched, last_pulse_ms, last_pause_ms, temps_c);
+            mqtt_publish_result(elapsed_ms, touched, last_pulse_ms, last_pause_ms, temp_max);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");
