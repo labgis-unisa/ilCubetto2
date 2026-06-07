@@ -7,8 +7,8 @@
 
 #define TAG "WIFI"
 
-#define WIFI_SSID      "ilCubetto"
-#define WIFI_PASSWORD  "ilCubettoPassword"
+#define WIFI_SSID      "fisciano" //"ilCubetto"
+#define WIFI_PASSWORD  "Qwertyuiop1234%" //"ilCubettoPassword"
 
 #define WIFI_CONNECTED_BIT BIT0
 static EventGroupHandle_t s_wifi_events;

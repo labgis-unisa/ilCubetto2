@@ -19,8 +19,11 @@ typedef struct
 /* Starts the MQTT client and subscribes to MQTT_TOPIC_CMD. */
 void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr);
 
+#define NTC_COUNT 3
+
 /* Publishes a result message to MQTT_TOPIC_VAL. */
 void mqtt_publish_result(uint32_t touch_time_ms,
                          const uint8_t touched[TOUCH_CHANNEL_COUNT],
                          const uint32_t pulse_ms[OUTPUT_COUNT],
-                         uint32_t pause_ms);
+                         uint32_t pause_ms,
+                         const float temps_c[NTC_COUNT]);

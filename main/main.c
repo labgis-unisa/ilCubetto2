@@ -11,10 +11,90 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "esp_adc/adc_oneshot.h"
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
 
 #define TAG "TOUCH"
+
+/* ---------- NTC temperature ---------- */
+/* Voltage divider: 3.3V -- 10K fixed -- GPIOx -- 10K NTC -- GND
+   GPIO1 = ADC1_CH0, GPIO2 = ADC1_CH1, GPIO3 = ADC1_CH2 (ESP32-S3) */
+#define NTC_COUNT        3
+#define NTC_SERIES_R     10000.0f   /* series resistor, ohms */
+#define NTC_NOMINAL_R    10000.0f   /* NTC resistance at 25 °C */
+#define NTC_NOMINAL_T    25.0f      /* nominal temperature, °C */
+#define NTC_BETA         3980.0f    /* NTC B-coefficient - TDK b57421V2103*/
+#define ADC_MAX_VAL      4095.0f    /* 12-bit ADC */
+#define NTC_OVERSAMPLE   16     /* ADC reads averaged per channel per call */
+#define NTC_MIN_VALID_C  15.0f  /* readings below this value are treated as invalid (open circuit / noise) */
+
+static const adc_channel_t s_ntc_channels[NTC_COUNT] = {
+    ADC_CHANNEL_1,  /* GPIO2 POLLICE*/
+    ADC_CHANNEL_2,  /* GPIO3 INDICE*/
+    ADC_CHANNEL_0,  /* GPIO1 MEDIO*/
+};
+
+/* Per-channel calibration offsets (°C to subtract), measured vs thermocouple reference */
+static const float s_ntc_offset_c[NTC_COUNT] = {
+    20.8f,  /* GPIO2 */
+    20.8f,  /* GPIO3 */
+    20.8f,  /* GPIO1 */
+};
+
+static adc_oneshot_unit_handle_t s_adc_handle;
+
+static void ntc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,   /* 0–3.3 V range */
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    for (int i = 0; i < NTC_COUNT; i++) {
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, s_ntc_channels[i], &chan_cfg));
+    }
+}
+
+static float ntc_raw_to_celsius(int raw, float offset_c)
+{
+    /* Voltage divider: Vout = Vcc * R_series / (NTC + R_series)
+       => NTC = R_series * (ADC_MAX - raw) / raw */
+    float r_ntc = NTC_SERIES_R * (ADC_MAX_VAL - (float)raw) / (float)raw;
+
+    /* Steinhart-Hart (simplified B-parameter equation):
+       1/T = 1/T0 + (1/B) * ln(R/R0)   [T in Kelvin] */
+    float t_kelvin = 1.0f / (1.0f / (NTC_NOMINAL_T + 273.15f)
+                             + logf(r_ntc / NTC_NOMINAL_R) / NTC_BETA);
+    return t_kelvin - 273.15f - offset_c;
+}
+
+
+static float s_ntc_last_valid[NTC_COUNT] = {NTC_MIN_VALID_C, NTC_MIN_VALID_C, NTC_MIN_VALID_C};
+
+static void ntc_read_all(float out_celsius[NTC_COUNT])
+{
+    for (int i = 0; i < NTC_COUNT; i++) {
+        int32_t sum = 0;
+        for (int s = 0; s < NTC_OVERSAMPLE; s++) {
+            int raw = 0;
+            ESP_ERROR_CHECK(adc_oneshot_read(s_adc_handle, s_ntc_channels[i], &raw));
+            sum += raw;
+        }
+        float t = ntc_raw_to_celsius((int)(sum / NTC_OVERSAMPLE), s_ntc_offset_c[i]);
+        if (t >= NTC_MIN_VALID_C) {
+            s_ntc_last_valid[i] = t;
+        } else {
+            ESP_LOGW(TAG, "NTC[%d] reading %.1f °C below minimum, using last valid %.1f °C", i, t, s_ntc_last_valid[i]);
+        }
+        out_celsius[i] = s_ntc_last_valid[i];
+    }
+}
 
 /* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
 #define DEBUG_SINGLE_FINGER 0
@@ -171,9 +251,14 @@ static void outputs_stop(void)
 static const int touch_chan_ids[TOUCH_CHANNEL_COUNT] = {4, 5, 6};
 #define INIT_SCAN_TIMES 3
 
+/* Touch hysteresis: activate above thresh_on (+12.5% above benchmark),
+   deactivate below thresh_off (+4% above benchmark, i.e. between baseline and thresh_on) */
+
 static touch_sensor_handle_t  s_sens_handle;
 static touch_channel_handle_t s_chan_handle[TOUCH_CHANNEL_COUNT];
-static uint32_t s_channel_thresh[TOUCH_CHANNEL_COUNT] = {};
+static uint32_t s_channel_thresh_on[TOUCH_CHANNEL_COUNT]  = {};
+static uint32_t s_channel_thresh_off[TOUCH_CHANNEL_COUNT] = {};
+static bool     s_ch_state[TOUCH_CHANNEL_COUNT]           = {};
 
 static void touch_initial_scanning(void)
 {
@@ -197,9 +282,10 @@ static void touch_initial_scanning(void)
             .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
         };
         ESP_ERROR_CHECK(touch_sensor_reconfig_channel(s_chan_handle[i], &cfg));
-        s_channel_thresh[i] = cfg.active_thresh[0];
-        ESP_LOGI(TAG, "CH%d benchmark=%" PRIu32 " threshold=%" PRIu32,
-                 touch_chan_ids[i], benchmark[0], s_channel_thresh[i]);
+        s_channel_thresh_on[i]  = cfg.active_thresh[0];           /* benchmark + 12.5% */
+        s_channel_thresh_off[i] = benchmark[0] + (benchmark[0] / 25); /* benchmark +  4%  */
+        ESP_LOGI(TAG, "CH%d benchmark=%" PRIu32 " thresh_on=%" PRIu32 " thresh_off=%" PRIu32,
+                 touch_chan_ids[i], benchmark[0], s_channel_thresh_on[i], s_channel_thresh_off[i]);
     }
 }
 
@@ -207,6 +293,7 @@ static void touch_initial_scanning(void)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    ntc_init();
     wifi_init();
 
     outputs_init();
@@ -247,16 +334,25 @@ void app_main(void)
     uint32_t last_pause_ms        = 0;
 
     while (1) {
+        float temps_c[NTC_COUNT];
+        ntc_read_all(temps_c);
+        ESP_LOGI(TAG, "NTC temp: GPIO1=%.1f °C  GPIO2=%.1f °C  GPIO3=%.1f °C",
+                 temps_c[0], temps_c[1], temps_c[2]);
+
         uint32_t data[TOUCH_SAMPLE_CFG_NUM] = {};
         bool     ch_active[TOUCH_CHANNEL_COUNT];
 
         for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
             touch_channel_read_data(s_chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, data);
-            ch_active[i] = (data[0] > s_channel_thresh[i]);
-            ESP_LOGI(TAG, "CH%d: %s value=%" PRIu32 " thresh=%" PRIu32,
+            if (!s_ch_state[i] && data[0] > s_channel_thresh_on[i])
+                s_ch_state[i] = true;
+            else if (s_ch_state[i] && data[0] < s_channel_thresh_off[i])
+                s_ch_state[i] = false;
+            ch_active[i] = s_ch_state[i];
+            ESP_LOGI(TAG, "CH%d: %s value=%" PRIu32 " on=%" PRIu32 " off=%" PRIu32,
                      touch_chan_ids[i],
                      ch_active[i] ? "\033[31mON\033[0m" : "OFF",
-                     data[0], s_channel_thresh[i]);
+                     data[0], s_channel_thresh_on[i], s_channel_thresh_off[i]);
         }
 
 #if DEBUG_SINGLE_FINGER
@@ -297,7 +393,7 @@ void app_main(void)
             for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
                 touched[i] = ch_active[i] ? 1 : 0;
             }
-            mqtt_publish_result(elapsed_ms, touched, last_pulse_ms, last_pause_ms);
+            mqtt_publish_result(elapsed_ms, touched, last_pulse_ms, last_pause_ms, temps_c);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");

@@ -112,7 +112,8 @@ void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr)
 void mqtt_publish_result(uint32_t touch_time_ms,
                          const uint8_t  touched[TOUCH_CHANNEL_COUNT],
                          const uint32_t pulse_ms[OUTPUT_COUNT],
-                         uint32_t pause_ms)
+                         uint32_t pause_ms,
+                         const float    temps_c[NTC_COUNT])
 {
     char last_json[256];
     xSemaphoreTake(s_last_json_mutex, portMAX_DELAY);
@@ -136,6 +137,12 @@ void mqtt_publish_result(uint32_t touch_time_ms,
     cJSON_AddItemToObject(root, "pulse_ms", jpulse);
 
     cJSON_AddNumberToObject(root, "pause_ms", pause_ms);
+
+    cJSON *jtemps = cJSON_CreateArray();
+    for (int i = 0; i < NTC_COUNT; i++) {
+        cJSON_AddItemToArray(jtemps, cJSON_CreateNumber((double)temps_c[i]));
+    }
+    cJSON_AddItemToObject(root, "temps_c", jtemps);
 
     // if (last_json[0] != '\0') {
     //     cJSON *orig = cJSON_Parse(last_json);
