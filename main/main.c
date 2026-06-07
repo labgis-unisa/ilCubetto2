@@ -75,7 +75,8 @@ static float ntc_raw_to_celsius(int raw, float offset_c)
     float t_kelvin = 1.0f / (1.0f / (NTC_NOMINAL_T + 273.15f)
                              + logf(r_ntc / NTC_NOMINAL_R) / NTC_BETA);
     /* offset_c combines the fixed hardware trim and the dynamic inter-channel equalisation */
-    return t_kelvin - 273.15f - offset_c;
+    float t_c = t_kelvin - 273.15f - offset_c;
+    return t_c ;
 }
 
 
