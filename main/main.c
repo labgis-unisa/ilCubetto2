@@ -39,9 +39,9 @@ static const adc_channel_t s_ntc_channels[NTC_COUNT] = {
    s_ntc_offset_fixed: measured vs thermocouple reference (hardware trim).
    s_ntc_offset_dyn:   computed at startup so all channels read the same initial value. */
 static const float s_ntc_offset_fixed[NTC_COUNT] = {
-    20.8f,  /* GPIO2 */
-    20.8f,  /* GPIO3 */
-    20.8f,  /* GPIO1 */
+    20.1f,  /* GPIO2 */
+    20.4f,  /* GPIO3 */
+    20.1f,  /* GPIO1 */
 };
 
 /* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
@@ -321,20 +321,21 @@ static void ntc_calibrate(void)
     }
 
     float means[NTC_COUNT];
-    float grand_mean = 0.0f;
     for (int i = 0; i < NTC_COUNT; i++) {
-        means[i]   = sums[i] / NTC_CAL_SAMPLES;
-        grand_mean += means[i];
+        means[i] = sums[i] / NTC_CAL_SAMPLES;
     }
-    grand_mean /= NTC_COUNT;
+
+    /* GPIO1 is the empirically calibrated reference channel (index 2 in s_ntc_channels).
+       Align all other channels to its initial reading. */
+    float ref_mean = means[2];
 
     for (int i = 0; i < NTC_COUNT; i++) {
         /* positive offset → subtract → lowers the reading of hotter channels */
-        s_ntc_offset_dyn[i] = means[i] - grand_mean;
+        s_ntc_offset_dyn[i] = means[i] - ref_mean;
         ESP_LOGI(TAG, "NTC[%d] cal mean=%.2f °C  dyn_offset=%+.2f °C",
                  i, means[i], s_ntc_offset_dyn[i]);
     }
-    ESP_LOGI(TAG, "NTC calibration done — target=%.2f °C", grand_mean);
+    ESP_LOGI(TAG, "NTC calibration done — target=%.2f °C (GPIO1 reference)", ref_mean);
 }
 
 /* ---------- Main ---------- */
