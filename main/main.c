@@ -43,6 +43,17 @@ static const float s_ntc_offset_fixed[NTC_COUNT] = {
     20.8f,  /* GPIO3 */
     20.8f,  /* GPIO1 */
 };
+
+/* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
+#define DEBUG_SINGLE_FINGER 0
+
+/* After this many ms of pulsing, hold outputs continuously ON to stabilise temperature */
+#define STABILIZE_AFTER_MS 5000
+
+/* ---------- Temperature setpoint controller ---------- */
+#define TEMP_SETPOINT_C     30.0f   /* target channel temperature, °C */
+#define TEMP_HYST_C          1.0f   /* hysteresis band: heat ON below (setpoint - hyst), OFF above (setpoint + hyst) */
+
 static float s_ntc_offset_dyn[NTC_COUNT] = {0.0f, 0.0f, 0.0f};
 
 static adc_oneshot_unit_handle_t s_adc_handle;
@@ -102,11 +113,7 @@ static void ntc_read_all(float out_celsius[NTC_COUNT])
     }
 }
 
-/* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
-#define DEBUG_SINGLE_FINGER 0
-
-/* After this many ms of pulsing, hold outputs continuously ON to stabilise temperature */
-#define STABILIZE_AFTER_MS 5000
+static bool s_temp_ctrl_on[OUTPUT_COUNT] = {true, true, true}; /* per-channel heating enable */
 
 /* ---------- Output GPIOs ---------- */
 static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
@@ -416,12 +423,35 @@ void app_main(void)
             for (int i = 0; i < NTC_COUNT; i++) {
                 if (temps_c[i] > temp_max[i]) temp_max[i] = temps_c[i];
             }
+
+            /* Bang-bang temperature control: enable/disable each channel's heating
+               based on its NTC reading vs the setpoint with hysteresis. */
+            bool changed = false;
+            xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
+            for (int i = 0; i < OUTPUT_COUNT; i++) {
+                if (s_temp_ctrl_on[i] && temps_c[i] >= TEMP_SETPOINT_C + TEMP_HYST_C) {
+                    s_temp_ctrl_on[i] = false;
+                    s_pulse_ms[i] = 0;
+                    changed = true;
+                    ESP_LOGI(TAG, "CTRL CH%d OFF (%.1f °C >= %.1f °C)",
+                             i, temps_c[i], TEMP_SETPOINT_C + TEMP_HYST_C);
+                } else if (!s_temp_ctrl_on[i] && temps_c[i] <= TEMP_SETPOINT_C - TEMP_HYST_C) {
+                    s_temp_ctrl_on[i] = true;
+                    s_pulse_ms[i] = last_pulse_ms[i];
+                    changed = true;
+                    ESP_LOGI(TAG, "CTRL CH%d ON  (%.1f °C <= %.1f °C)",
+                             i, temps_c[i], TEMP_SETPOINT_C - TEMP_HYST_C);
+                }
+            }
+            xSemaphoreGive(s_pulse_mutex);
+            (void)changed; /* pulse_task reads s_pulse_ms at next cycle start */
         }
 
         if (all_now && !all_active && is_new_cmd) {
             all_active  = true;
             touch_start = esp_timer_get_time();
             for (int i = 0; i < NTC_COUNT; i++) temp_max[i] = temps_c[i];
+            for (int i = 0; i < OUTPUT_COUNT; i++) s_temp_ctrl_on[i] = true; /* reset controller */
 
             xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
             memcpy(last_pulse_ms, s_cmd.pulse_ms, sizeof(s_cmd.pulse_ms));
