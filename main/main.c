@@ -285,8 +285,10 @@ static void touch_initial_scanning(void)
         uint32_t benchmark[TOUCH_SAMPLE_CFG_NUM] = {};
         ESP_ERROR_CHECK(touch_channel_read_data(s_chan_handle[i],
                         TOUCH_CHAN_DATA_TYPE_BENCHMARK, benchmark));
-        /* Compute adaptive threshold from benchmark to avoid fixed literals */
-        uint32_t thresh = benchmark[0] + (benchmark[0] / 8); /* +12.5% margin */
+        /* Compute adaptive threshold from benchmark; CH5 (index 1) uses +8% for higher sensitivity */
+        uint32_t thresh = (touch_chan_ids[i] == 5)
+                          ? benchmark[0] + (benchmark[0] / 12)  /* +8% margin for CH5 */
+                          : benchmark[0] + (benchmark[0] / 8);  /* +12.5% margin for other channels */
         if (thresh < 1000) thresh = 1000;
         if (thresh > 60000) thresh = 60000;
         touch_channel_config_t cfg = {
