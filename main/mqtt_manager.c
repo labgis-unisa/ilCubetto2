@@ -17,9 +17,6 @@ static mqtt_cmd_t       *s_cmd;
 static SemaphoreHandle_t s_cmd_mutex;
 static bool             *s_is_new_cmd_ptr;
 
-static SemaphoreHandle_t s_last_json_mutex;
-static char              s_last_json[256];
-
 static void handle_command(const char *payload, int len)
 {
     char buf[256];
@@ -35,31 +32,24 @@ static void handle_command(const char *payload, int len)
         return;
     }
 
-    cJSON *jpulse = cJSON_GetObjectItem(root, "pulse_ms");
-    cJSON *jpause = cJSON_GetObjectItem(root, "pause_ms");
-
-    ESP_LOGI(TAG, "pulse_ms field: %s",
-             jpulse == NULL ? "missing" :
-             cJSON_IsArray(jpulse) ? "array (ok)" : "wrong type");
+    cJSON *jsetpoint  = cJSON_GetObjectItem(root, "temp_setpoint_c");
+    cJSON *jchannels  = cJSON_GetObjectItem(root, "channels");
 
     xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
-    if (cJSON_IsArray(jpulse)) {
-        for (int i = 0; i < OUTPUT_COUNT && i < cJSON_GetArraySize(jpulse); i++) {
-            cJSON *item = cJSON_GetArrayItem(jpulse, i);
-            s_cmd->pulse_ms[i] = cJSON_IsNumber(item) ? (uint32_t)item->valueint : 0;
+    if (cJSON_IsNumber(jsetpoint)) {
+        s_cmd->temp_setpoint_c = (float)jsetpoint->valuedouble;
+    }
+    if (cJSON_IsArray(jchannels)) {
+        for (int i = 0; i < OUTPUT_COUNT && i < cJSON_GetArraySize(jchannels); i++) {
+            cJSON *item = cJSON_GetArrayItem(jchannels, i);
+            s_cmd->channel_enabled[i] = cJSON_IsNumber(item) ? (item->valueint != 0) : true;
         }
     }
-    if (cJSON_IsNumber(jpause)) s_cmd->pause_ms = (uint32_t)jpause->valueint;
-    ESP_LOGI(TAG, "cmd after update: pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] pause=%" PRIu32 "ms",
-             s_cmd->pulse_ms[0], s_cmd->pulse_ms[1], s_cmd->pulse_ms[2],
-             s_cmd->pause_ms);
+    ESP_LOGI(TAG, "cmd after update: temp_setpoint_c=%.1f °C  channels=[%d,%d,%d]",
+             s_cmd->temp_setpoint_c,
+             s_cmd->channel_enabled[0], s_cmd->channel_enabled[1], s_cmd->channel_enabled[2]);
     *s_is_new_cmd_ptr = true;
     xSemaphoreGive(s_cmd_mutex);
-
-    xSemaphoreTake(s_last_json_mutex, portMAX_DELAY);
-    strncpy(s_last_json, buf, sizeof(s_last_json) - 1);
-    s_last_json[sizeof(s_last_json) - 1] = '\0';
-    xSemaphoreGive(s_last_json_mutex);
 
     esp_mqtt_client_publish(s_client, MQTT_TOPIC_READY, "{\"status\":\"ready\"}", 0, 1, 0);
     ESP_LOGI(TAG, "pub " MQTT_TOPIC_READY " -> ready");
@@ -96,13 +86,9 @@ void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr)
     s_cmd             = cmd;
     s_cmd_mutex       = (SemaphoreHandle_t)cmd_mutex;
     s_is_new_cmd_ptr  = is_new_cmd_ptr;
-    s_last_json_mutex = xSemaphoreCreateMutex();
-    s_last_json[0]    = '\0';
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
-        // .credentials.username = "user",
-        // .credentials.authentication.password = "password",
     };
     s_client = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,
@@ -112,16 +98,9 @@ void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr)
 
 void mqtt_publish_result(uint32_t touch_time_ms,
                          const uint8_t  touched[TOUCH_CHANNEL_COUNT],
-                         const uint32_t pulse_ms[OUTPUT_COUNT],
-                         uint32_t pause_ms,
+                         float setpoint_c,
                          const float    temps_c[NTC_COUNT])
 {
-    char last_json[256];
-    xSemaphoreTake(s_last_json_mutex, portMAX_DELAY);
-    strncpy(last_json, s_last_json, sizeof(last_json) - 1);
-    last_json[sizeof(last_json) - 1] = '\0';
-    xSemaphoreGive(s_last_json_mutex);
-
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "touch_time_ms", touch_time_ms);
 
@@ -131,26 +110,13 @@ void mqtt_publish_result(uint32_t touch_time_ms,
     }
     cJSON_AddItemToObject(root, "touched", jtouched);
 
-    cJSON *jpulse = cJSON_CreateArray();
-    for (int i = 0; i < OUTPUT_COUNT; i++) {
-        cJSON_AddItemToArray(jpulse, cJSON_CreateNumber(pulse_ms[i]));
-    }
-    cJSON_AddItemToObject(root, "pulse_ms", jpulse);
-
-    cJSON_AddNumberToObject(root, "pause_ms", pause_ms);
+    cJSON_AddNumberToObject(root, "temp_setpoint_c", roundf(setpoint_c * 10.0f) / 10.0f);
 
     cJSON *jtemps = cJSON_CreateArray();
     for (int i = 0; i < NTC_COUNT; i++) {
         cJSON_AddItemToArray(jtemps, cJSON_CreateNumber(roundf(temps_c[i] * 10.0f) / 10.0f));
     }
     cJSON_AddItemToObject(root, "temps_c", jtemps);
-
-    // if (last_json[0] != '\0') {
-    //     cJSON *orig = cJSON_Parse(last_json);
-    //     if (orig) {
-    //         cJSON_AddItemToObject(root, "command", orig);
-    //     }
-    // }
 
     char *out = cJSON_PrintUnformatted(root);
     if (out) {

@@ -24,10 +24,11 @@
 #define NTC_SERIES_R     10000.0f   /* series resistor, ohms */
 #define NTC_NOMINAL_R    10000.0f   /* NTC resistance at 25 °C */
 #define NTC_NOMINAL_T    25.0f      /* nominal temperature, °C */
-#define NTC_BETA         3980.0f    /* NTC B-coefficient - TDK b57421V2103*/
+#define NTC_BETA         3940.0f    /* NTC B25/50 coefficient - TDK B57421V2103 (range 25–50°C matches operating point) */
 #define ADC_MAX_VAL      4095.0f    /* 12-bit ADC */
-#define NTC_OVERSAMPLE   16     /* ADC reads averaged per channel per call */
-#define NTC_MIN_VALID_C  15.0f  /* readings below this value are treated as invalid (open circuit / noise) */
+#define NTC_OVERSAMPLE   16         /* ADC reads per median window */
+#define NTC_MIN_VALID_C  15.0f      /* readings below this are treated as invalid (open circuit / noise) */
+#define NTC_EMA_ALPHA    0.2f       /* EMA smoothing factor: lower = smoother but slower (0.1–0.3 typical) */
 
 static const adc_channel_t s_ntc_channels[NTC_COUNT] = {
     ADC_CHANNEL_1,  /* GPIO2 POLLICE*/
@@ -47,9 +48,21 @@ static const float s_ntc_offset_fixed[NTC_COUNT] = {
 /* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
 #define DEBUG_SINGLE_FINGER 0
 
+/* Set to 1: when all fingers are released, disable all channels and stop heating until
+   a new MQTT command arrives. Set to 0: release has no effect on the heater state
+   (heating continues until explicitly stopped via MQTT or a new touch session). */
+#define STOP_ON_TOUCH_RELEASE 1
+
 /* ---------- Temperature setpoint controller ---------- */
-#define TEMP_SETPOINT_C     50.0f   /* target channel temperature, °C */
-#define TEMP_HYST_C          1.0f   /* hysteresis band: heat ON below (setpoint - hyst), OFF above (setpoint + hyst) */
+#define TEMP_SETPOINT_DEFAULT_C  43.0f  /* target skin-contact temperature, overridable via MQTT */
+#define TEMP_HYST_C               1.0f  /* hysteresis band half-width */
+#define TEMP_SAFETY_MARGIN_C      3.0f  /* NTC thermal lag compensation: heater turns OFF at (setpoint - margin)
+                                           so real surface temperature stays at or below setpoint */
+#define TEMP_POLL_MS             200    /* NTC polling period inside pulse_task bang-bang loop */
+#define TEMP_NTC_SETTLE_MS        10    /* outputs OFF settling time before ADC read to avoid heater interference */
+
+static float s_setpoint_c = TEMP_SETPOINT_DEFAULT_C; /* updated from MQTT */
+static SemaphoreHandle_t s_setpoint_mutex;
 
 static float s_ntc_offset_dyn[NTC_COUNT] = {0.0f, 0.0f, 0.0f};
 
@@ -83,34 +96,48 @@ static float ntc_raw_to_celsius(int raw, float offset_c)
     float t_kelvin = 1.0f / (1.0f / (NTC_NOMINAL_T + 273.15f)
                              + logf(r_ntc / NTC_NOMINAL_R) / NTC_BETA);
     /* offset_c combines the fixed hardware trim and the dynamic inter-channel equalisation */
-    float t_c = t_kelvin - 273.15f - offset_c;
-    return t_c ;
+    return t_kelvin - 273.15f - offset_c;
 }
 
+static float s_ntc_ema[NTC_COUNT];        /* EMA state, initialised on first valid read */
+static bool  s_ntc_ema_init[NTC_COUNT];   /* true once EMA has been seeded */
 
-static float s_ntc_last_valid[NTC_COUNT] = {NTC_MIN_VALID_C, NTC_MIN_VALID_C, NTC_MIN_VALID_C};
+/* Insertion-sort median on a small array of ints */
+static int _median(int *a, int n)
+{
+    for (int i = 1; i < n; i++) {
+        int key = a[i], j = i - 1;
+        while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
+        a[j + 1] = key;
+    }
+    return a[n / 2];
+}
 
 static void ntc_read_all(float out_celsius[NTC_COUNT])
 {
     for (int i = 0; i < NTC_COUNT; i++) {
-        int32_t sum = 0;
+        int raws[NTC_OVERSAMPLE];
         for (int s = 0; s < NTC_OVERSAMPLE; s++) {
-            int raw = 0;
-            ESP_ERROR_CHECK(adc_oneshot_read(s_adc_handle, s_ntc_channels[i], &raw));
-            sum += raw;
+            ESP_ERROR_CHECK(adc_oneshot_read(s_adc_handle, s_ntc_channels[i], &raws[s]));
         }
-        float t = ntc_raw_to_celsius((int)(sum / NTC_OVERSAMPLE),
-                                     s_ntc_offset_fixed[i] + s_ntc_offset_dyn[i]);
+        /* Median removes impulse spikes that would corrupt a plain average */
+        int med = _median(raws, NTC_OVERSAMPLE);
+        float t = ntc_raw_to_celsius(med, s_ntc_offset_fixed[i] + s_ntc_offset_dyn[i]);
+
         if (t >= NTC_MIN_VALID_C) {
-            s_ntc_last_valid[i] = t;
+            if (!s_ntc_ema_init[i]) {
+                s_ntc_ema[i]      = t;   /* seed EMA with first valid reading */
+                s_ntc_ema_init[i] = true;
+            } else {
+                s_ntc_ema[i] = NTC_EMA_ALPHA * t + (1.0f - NTC_EMA_ALPHA) * s_ntc_ema[i];
+            }
         } else {
-            ESP_LOGW(TAG, "NTC[%d] reading %.1f °C below minimum, using last valid %.1f °C", i, t, s_ntc_last_valid[i]);
+            ESP_LOGW(TAG, "NTC[%d] median raw=%d → %.1f °C below minimum, using EMA %.1f °C",
+                     i, med, t, s_ntc_ema[i]);
         }
-        out_celsius[i] = s_ntc_last_valid[i];
+        out_celsius[i] = s_ntc_ema[i];
     }
 }
-
-static bool s_temp_ctrl_on[OUTPUT_COUNT] = {true, true, true}; /* per-channel heating enable */
 
 /* ---------- Output GPIOs ---------- */
 static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
@@ -119,24 +146,6 @@ static const gpio_num_t output_gpios[OUTPUT_COUNT] = {
     GPIO_NUM_9,
 };
 
-/* ---------- Current command ---------- */
-static SemaphoreHandle_t s_cmd_mutex;
-static mqtt_cmd_t s_cmd = {
-    .pulse_ms = {0, 0, 0},
-    .pause_ms = 2000,
-};
-static bool is_new_cmd = false;
-
-/* ---------- Pulse task ---------- */
-#define PULSE_NOTIFY_START 1
-#define PULSE_NOTIFY_STOP  2
-
-static SemaphoreHandle_t s_pulse_mutex;
-static TaskHandle_t      s_pulse_task;
-
-static uint32_t s_pulse_ms[OUTPUT_COUNT]; /* per-output pulse duration; 0 = off */
-static uint32_t s_pulse_pause_ms;
-
 static void outputs_all_off(void)
 {
     for (int i = 0; i < OUTPUT_COUNT; i++) {
@@ -144,63 +153,109 @@ static void outputs_all_off(void)
     }
 }
 
+/* ---------- Pulse task — pure bang-bang closed loop ---------- */
+#define PULSE_NOTIFY_START 1
+#define PULSE_NOTIFY_STOP  2
+
+static TaskHandle_t s_pulse_task;
+
+/* Per-channel enable mask, updated from MQTT, protected by s_setpoint_mutex */
+static bool s_channel_enabled[OUTPUT_COUNT] = {false, false, false};
+
+/* Shared temperature result written by pulse_task, read by app_main for MQTT publish */
+static SemaphoreHandle_t s_temps_mutex;
+static float             s_temps_snapshot[NTC_COUNT];
+static float             s_temp_max[NTC_COUNT];
+
 static void pulse_task(void *arg)
 {
     while (1) {
+        /* Wait for start notification */
         uint32_t note;
         do {
             xTaskNotifyWait(0, ULONG_MAX, &note, portMAX_DELAY);
         } while (note != PULSE_NOTIFY_START);
 
+        bool ch_on[OUTPUT_COUNT] = {false};
+
         while (1) {
-            /* Re-read pulse and pause settings each cycle so the closed-loop
-               controller in app_main can adjust s_pulse_ms[] in real time. */
-            xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
-            uint32_t pulse_ms[OUTPUT_COUNT];
-            uint32_t pause_ms = s_pulse_pause_ms;
-            memcpy(pulse_ms, s_pulse_ms, sizeof(s_pulse_ms));
-            xSemaphoreGive(s_pulse_mutex);
-
-            ESP_LOGI(TAG, "OUT ON  pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]",
-                     pulse_ms[0], pulse_ms[1], pulse_ms[2]);
-
-            /* Activate outputs that have a non-zero pulse duration */
-            for (int i = 0; i < OUTPUT_COUNT; i++) {
-                gpio_set_level(output_gpios[i], pulse_ms[i] > 0 ? 1 : 0);
+            /* Check for stop */
+            if (xTaskNotifyWait(0, ULONG_MAX, &note, 0) == pdTRUE) {
+                if (note == PULSE_NOTIFY_STOP) break;
             }
 
-            /* Turn off each output after its individual pulse duration */
-            uint32_t elapsed = 0;
-            bool stopped = false;
-            while (elapsed < UINT32_MAX) {
-                uint32_t next_off = UINT32_MAX;
-                for (int i = 0; i < OUTPUT_COUNT; i++) {
-                    if (pulse_ms[i] > elapsed && pulse_ms[i] < next_off) {
-                        next_off = pulse_ms[i];
-                    }
-                }
-                if (next_off == UINT32_MAX) break;
-
-                uint32_t wait = next_off - elapsed;
-                xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(wait));
-                if (note == PULSE_NOTIFY_STOP) { stopped = true; break; }
-                elapsed = next_off;
-
-                for (int i = 0; i < OUTPUT_COUNT; i++) {
-                    if (pulse_ms[i] <= elapsed) {
-                        gpio_set_level(output_gpios[i], 0);
-                    }
-                }
-            }
+            /* Briefly cut all outputs before reading NTC to eliminate heater
+               switching noise that corrupts the ADC when outputs are ON. */
             outputs_all_off();
-            ESP_LOGI(TAG, "OUT OFF [0 0 0]");
+            vTaskDelay(pdMS_TO_TICKS(TEMP_NTC_SETTLE_MS));
 
-            if (stopped) break;
+            float temps[NTC_COUNT];
+            ntc_read_all(temps);
 
-            ESP_LOGI(TAG, "PAUSE %" PRIu32 "ms", pause_ms);
-            xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(pause_ms));
-            if (note == PULSE_NOTIFY_STOP) break;
+            /* Restore outputs that were ON before the measurement window */
+            for (int i = 0; i < OUTPUT_COUNT; i++) {
+                if (ch_on[i]) gpio_set_level(output_gpios[i], 1);
+            }
+
+            xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
+            float setpoint = s_setpoint_c;
+            bool ch_enabled[OUTPUT_COUNT];
+            memcpy(ch_enabled, s_channel_enabled, sizeof(ch_enabled));
+            xSemaphoreGive(s_setpoint_mutex);
+
+            ESP_LOGI(TAG, "NTC temp: %.1f °C  %.1f °C  %.1f °C  setpoint=%.1f °C",
+                     temps[0], temps[1], temps[2], setpoint);
+
+            /* Bang-bang with coldest-channel gating and safety margin:
+               - OFF threshold: (setpoint - SAFETY_MARGIN_C) — heater stops early to
+                 absorb thermal lag; real surface temperature reaches setpoint after
+                 the NTC catches up, but never exceeds it.
+               - ON threshold: (setpoint - SAFETY_MARGIN_C - HYST_C) — all channels
+                 must be below this before any re-ignites (coldest-channel gating). */
+            float off_thresh = setpoint - TEMP_SAFETY_MARGIN_C;
+            float on_thresh  = off_thresh - TEMP_HYST_C;
+
+            /* Disabled channels are forced off immediately */
+            for (int i = 0; i < OUTPUT_COUNT; i++) {
+                if (!ch_enabled[i] && ch_on[i]) {
+                    ch_on[i] = false;
+                    gpio_set_level(output_gpios[i], 0);
+                    ESP_LOGI(TAG, "CTRL CH%d OFF (disabled)", i);
+                }
+            }
+
+            /* Coldest-channel gating: consider only enabled channels */
+            bool all_cold = true;
+            for (int i = 0; i < OUTPUT_COUNT; i++) {
+                if (ch_enabled[i] && temps[i] >= on_thresh) { all_cold = false; break; }
+            }
+
+            for (int i = 0; i < OUTPUT_COUNT; i++) {
+                if (!ch_enabled[i]) continue;
+                if (!ch_on[i] && all_cold) {
+                    ch_on[i] = true;
+                    gpio_set_level(output_gpios[i], 1);
+                    ESP_LOGI(TAG, "CTRL CH%d ON  (%.1f °C, all < %.1f °C)", i, temps[i], on_thresh);
+                } else if (ch_on[i] && temps[i] >= off_thresh) {
+                    ch_on[i] = false;
+                    gpio_set_level(output_gpios[i], 0);
+                    ESP_LOGI(TAG, "CTRL CH%d OFF (%.1f °C >= %.1f °C)", i, temps[i], off_thresh);
+                }
+            }
+
+            /* Update shared snapshot for app_main */
+            xSemaphoreTake(s_temps_mutex, portMAX_DELAY);
+            for (int i = 0; i < NTC_COUNT; i++) {
+                s_temps_snapshot[i] = temps[i];
+                if (temps[i] > s_temp_max[i]) s_temp_max[i] = temps[i];
+            }
+            xSemaphoreGive(s_temps_mutex);
+
+            vTaskDelay(pdMS_TO_TICKS(TEMP_POLL_MS));
         }
+
+        outputs_all_off();
+        ESP_LOGI(TAG, "pulse_task stopped — all outputs OFF");
     }
 }
 
@@ -212,17 +267,12 @@ static void outputs_init(void)
         gpio_set_level(output_gpios[i], 0);
     }
 
-    s_pulse_mutex = xSemaphoreCreateMutex();
+    s_temps_mutex = xSemaphoreCreateMutex();
     xTaskCreate(pulse_task, "pulse", 4096, NULL, 5, &s_pulse_task);
 }
 
-static void outputs_start(const uint32_t pulse_ms[OUTPUT_COUNT], uint32_t pause_ms)
+static void outputs_start(void)
 {
-    xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
-    memcpy(s_pulse_ms, pulse_ms, sizeof(s_pulse_ms));
-    s_pulse_pause_ms = pause_ms;
-    xSemaphoreGive(s_pulse_mutex);
-
     xTaskNotify(s_pulse_task, PULSE_NOTIFY_START, eSetValueWithOverwrite);
 }
 
@@ -269,7 +319,7 @@ static void touch_initial_scanning(void)
             .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
         };
         ESP_ERROR_CHECK(touch_sensor_reconfig_channel(s_chan_handle[i], &cfg));
-        s_channel_thresh_on[i]  = cfg.active_thresh[0];           /* benchmark + 12.5% */
+        s_channel_thresh_on[i]  = cfg.active_thresh[0];               /* benchmark + 12.5% */
         s_channel_thresh_off[i] = benchmark[0] + (benchmark[0] / 25); /* benchmark +  4%  */
         ESP_LOGI(TAG, "CH%d benchmark=%" PRIu32 " thresh_on=%" PRIu32 " thresh_off=%" PRIu32,
                  touch_chan_ids[i], benchmark[0], s_channel_thresh_on[i], s_channel_thresh_off[i]);
@@ -312,6 +362,14 @@ static void ntc_calibrate(void)
     ESP_LOGI(TAG, "NTC calibration done — target=%.2f °C (GPIO1 reference)", ref_mean);
 }
 
+/* ---------- Current command ---------- */
+static SemaphoreHandle_t s_cmd_mutex;
+static mqtt_cmd_t s_cmd = {
+    .temp_setpoint_c  = TEMP_SETPOINT_DEFAULT_C,
+    .channel_enabled  = {false, false, false},
+};
+static bool is_new_cmd = false;
+
 /* ---------- Main ---------- */
 void app_main(void)
 {
@@ -347,24 +405,17 @@ void app_main(void)
 
     wifi_init();
 
+    s_setpoint_mutex = xSemaphoreCreateMutex();
     outputs_init();
 
     s_cmd_mutex = xSemaphoreCreateMutex();
     mqtt_init(&s_cmd, s_cmd_mutex, &is_new_cmd);
     ESP_LOGI(TAG, "Touch sensor running");
 
-    bool     all_active           = false;
-    int64_t  touch_start          = 0;
-    uint32_t last_pulse_ms[OUTPUT_COUNT] = {};
-    uint32_t last_pause_ms        = 0;
-    float    temp_max[NTC_COUNT]  = {};
+    bool    all_active  = false;
+    int64_t touch_start = 0;
 
     while (1) {
-        float temps_c[NTC_COUNT];
-        ntc_read_all(temps_c);
-        ESP_LOGI(TAG, "NTC temp: GPIO2=%.1f °C  GPIO3=%.1f °C  GPIO1=%.1f °C",
-                 temps_c[0], temps_c[1], temps_c[2]);
-
         uint32_t data[TOUCH_SAMPLE_CFG_NUM] = {};
         bool     ch_active[TOUCH_CHANNEL_COUNT];
 
@@ -382,7 +433,6 @@ void app_main(void)
         }
 
 #if DEBUG_SINGLE_FINGER
-        /* Debug mode: any single finger is enough to start */
         bool all_now = false;
         for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
             if (ch_active[i]) { all_now = true; break; }
@@ -394,54 +444,45 @@ void app_main(void)
         }
 #endif
 
-        if (all_active) {
-            for (int i = 0; i < NTC_COUNT; i++) {
-                if (temps_c[i] > temp_max[i]) temp_max[i] = temps_c[i];
-            }
-
-            /* Bang-bang temperature control: enable/disable each channel's heating
-               based on its NTC reading vs the setpoint with hysteresis. */
-            bool changed = false;
-            xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
-            for (int i = 0; i < OUTPUT_COUNT; i++) {
-                if (s_temp_ctrl_on[i] && temps_c[i] >= TEMP_SETPOINT_C + TEMP_HYST_C) {
-                    s_temp_ctrl_on[i] = false;
-                    s_pulse_ms[i] = 0;
-                    changed = true;
-                    ESP_LOGI(TAG, "CTRL CH%d OFF (%.1f °C >= %.1f °C)",
-                             i, temps_c[i], TEMP_SETPOINT_C + TEMP_HYST_C);
-                } else if (!s_temp_ctrl_on[i] && temps_c[i] <= TEMP_SETPOINT_C - TEMP_HYST_C) {
-                    s_temp_ctrl_on[i] = true;
-                    s_pulse_ms[i] = last_pulse_ms[i];
-                    changed = true;
-                    ESP_LOGI(TAG, "CTRL CH%d ON  (%.1f °C <= %.1f °C)",
-                             i, temps_c[i], TEMP_SETPOINT_C - TEMP_HYST_C);
-                }
-            }
-            xSemaphoreGive(s_pulse_mutex);
-            (void)changed; /* pulse_task reads s_pulse_ms at next cycle start */
-        }
-
-        if (all_now && !all_active && is_new_cmd) {
-            all_active  = true;
-            touch_start = esp_timer_get_time();
-            for (int i = 0; i < NTC_COUNT; i++) temp_max[i] = temps_c[i];
-            for (int i = 0; i < OUTPUT_COUNT; i++) s_temp_ctrl_on[i] = true; /* reset controller */
-
+        /* Apply new setpoint and channel mask from MQTT — accepted while running or at start */
+        if (is_new_cmd) {
             xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
-            memcpy(last_pulse_ms, s_cmd.pulse_ms, sizeof(s_cmd.pulse_ms));
-            last_pause_ms = s_cmd.pause_ms;
+            float new_sp = s_cmd.temp_setpoint_c;
+            bool  new_en[OUTPUT_COUNT];
+            memcpy(new_en, s_cmd.channel_enabled, sizeof(new_en));
             is_new_cmd = false;
             xSemaphoreGive(s_cmd_mutex);
 
-            ESP_LOGI(TAG, "\033[32mALL ON — pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] pause=%" PRIu32 "ms\033[0m",
-                     last_pulse_ms[0], last_pulse_ms[1], last_pulse_ms[2], last_pause_ms);
-            ESP_LOGI(TAG, "\033[32m---------Starting outputs...\033[0m");
-            outputs_start(last_pulse_ms, last_pause_ms);
+            xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
+            s_setpoint_c = new_sp;
+            memcpy(s_channel_enabled, new_en, sizeof(s_channel_enabled));
+            xSemaphoreGive(s_setpoint_mutex);
+
+            ESP_LOGI(TAG, "Setpoint=%.1f °C  channels=[%d,%d,%d]",
+                     new_sp, new_en[0], new_en[1], new_en[2]);
+        }
+
+        if (all_now && !all_active && s_setpoint_c > 0) {
+            all_active  = true;
+            touch_start = esp_timer_get_time();
+
+            xSemaphoreTake(s_temps_mutex, portMAX_DELAY);
+            for (int i = 0; i < NTC_COUNT; i++) s_temp_max[i] = s_temps_snapshot[i];
+            xSemaphoreGive(s_temps_mutex);
+
+            ESP_LOGI(TAG, "\033[32mALL ON — setpoint=%.1f °C\033[0m", s_setpoint_c);
+            outputs_start();
 
         } else if (!all_now && all_active) {
+#if STOP_ON_TOUCH_RELEASE
             all_active = false;
             outputs_stop();
+
+            /* Reset channel mask so a new command is required before next session */
+            xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
+            for (int i = 0; i < OUTPUT_COUNT; i++) s_channel_enabled[i] = false;
+            xSemaphoreGive(s_setpoint_mutex);
+#endif
             uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - touch_start) / 1000);
             ESP_LOGI(TAG, "\033[32mALL OFF — touch held %" PRIu32 " ms\033[0m", elapsed_ms);
 
@@ -449,7 +490,17 @@ void app_main(void)
             for (int i = 0; i < TOUCH_CHANNEL_COUNT; i++) {
                 touched[i] = ch_active[i] ? 1 : 0;
             }
-            mqtt_publish_result(elapsed_ms, touched, last_pulse_ms, last_pause_ms, temp_max);
+
+            float temp_max_snapshot[NTC_COUNT];
+            xSemaphoreTake(s_temps_mutex, portMAX_DELAY);
+            memcpy(temp_max_snapshot, s_temp_max, sizeof(s_temp_max));
+            xSemaphoreGive(s_temps_mutex);
+
+            xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
+            float sp = s_setpoint_c;
+            xSemaphoreGive(s_setpoint_mutex);
+
+            mqtt_publish_result(elapsed_ms, touched, sp, temp_max_snapshot);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");
