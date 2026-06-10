@@ -47,11 +47,8 @@ static const float s_ntc_offset_fixed[NTC_COUNT] = {
 /* Set to 1 to require only one finger to start the experiment (debug/measurement mode) */
 #define DEBUG_SINGLE_FINGER 0
 
-/* After this many ms of pulsing, hold outputs continuously ON to stabilise temperature */
-#define STABILIZE_AFTER_MS 5000
-
 /* ---------- Temperature setpoint controller ---------- */
-#define TEMP_SETPOINT_C     30.0f   /* target channel temperature, °C */
+#define TEMP_SETPOINT_C     50.0f   /* target channel temperature, °C */
 #define TEMP_HYST_C          1.0f   /* hysteresis band: heat ON below (setpoint - hyst), OFF above (setpoint + hyst) */
 
 static float s_ntc_offset_dyn[NTC_COUNT] = {0.0f, 0.0f, 0.0f};
@@ -134,12 +131,6 @@ static bool is_new_cmd = false;
 #define PULSE_NOTIFY_START 1
 #define PULSE_NOTIFY_STOP  2
 
-/* Number of pulse cycles over which the pause ramps up logarithmically 
-Higher values make the pause ramp more gradually, but also mean it takes longer to reach the full pause duration.
-Lower values make the pause ramp more quickly, but may cause a more abrupt change in pause duration between cycles.
-*/
-#define RAMP_CYCLES 8
-
 static SemaphoreHandle_t s_pulse_mutex;
 static TaskHandle_t      s_pulse_task;
 
@@ -161,23 +152,15 @@ static void pulse_task(void *arg)
             xTaskNotifyWait(0, ULONG_MAX, &note, portMAX_DELAY);
         } while (note != PULSE_NOTIFY_START);
 
-        xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
-        uint32_t pulse_ms[OUTPUT_COUNT];
-        uint32_t pause_ms = s_pulse_pause_ms;
-        memcpy(pulse_ms, s_pulse_ms, sizeof(s_pulse_ms));
-        xSemaphoreGive(s_pulse_mutex);
-
-        int64_t run_start_us = esp_timer_get_time();
-        uint32_t cycle = 0;
         while (1) {
-            /* ---- stabilise phase: once STABILIZE_AFTER_MS has elapsed, lock the
-               ramp at full pause_ms so average power stays constant.
-               Constant average power → thermal equilibrium (temperature plateaus). ---- */
-            bool stabilised = (esp_timer_get_time() - run_start_us) >= (int64_t)STABILIZE_AFTER_MS * 1000;
-            if (stabilised && cycle <= RAMP_CYCLES) {
-                cycle = RAMP_CYCLES; /* skip remaining ramp steps */
-                ESP_LOGI(TAG, "\033[33mSTABLE — fixed duty cycle, pause=%" PRIu32 "ms\033[0m", pause_ms);
-            }
+            /* Re-read pulse and pause settings each cycle so the closed-loop
+               controller in app_main can adjust s_pulse_ms[] in real time. */
+            xSemaphoreTake(s_pulse_mutex, portMAX_DELAY);
+            uint32_t pulse_ms[OUTPUT_COUNT];
+            uint32_t pause_ms = s_pulse_pause_ms;
+            memcpy(pulse_ms, s_pulse_ms, sizeof(s_pulse_ms));
+            xSemaphoreGive(s_pulse_mutex);
+
             ESP_LOGI(TAG, "OUT ON  pulse_ms=[%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]",
                      pulse_ms[0], pulse_ms[1], pulse_ms[2]);
 
@@ -190,14 +173,13 @@ static void pulse_task(void *arg)
             uint32_t elapsed = 0;
             bool stopped = false;
             while (elapsed < UINT32_MAX) {
-                /* Find the next output to turn off */
                 uint32_t next_off = UINT32_MAX;
                 for (int i = 0; i < OUTPUT_COUNT; i++) {
                     if (pulse_ms[i] > elapsed && pulse_ms[i] < next_off) {
                         next_off = pulse_ms[i];
                     }
                 }
-                if (next_off == UINT32_MAX) break; /* all already off */
+                if (next_off == UINT32_MAX) break;
 
                 uint32_t wait = next_off - elapsed;
                 xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(wait));
@@ -215,18 +197,8 @@ static void pulse_task(void *arg)
 
             if (stopped) break;
 
-            /* Log ramp: pause grows from ~0 ms to pause_ms over RAMP_CYCLES cycles */
-            uint32_t current_pause;
-            if (cycle < RAMP_CYCLES && pause_ms > 0) {
-                float t = log2f((float)(cycle + 1)) / log2f((float)(RAMP_CYCLES + 1));
-                current_pause = (uint32_t)(pause_ms * t);
-            } else {
-                current_pause = pause_ms;
-            }
-            ESP_LOGI(TAG, "PAUSE %" PRIu32 "ms (ramp cycle %" PRIu32 ")", current_pause, cycle);
-            cycle++;
-
-            xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(current_pause));
+            ESP_LOGI(TAG, "PAUSE %" PRIu32 "ms", pause_ms);
+            xTaskNotifyWait(0, ULONG_MAX, &note, pdMS_TO_TICKS(pause_ms));
             if (note == PULSE_NOTIFY_STOP) break;
         }
     }
