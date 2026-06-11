@@ -25,4 +25,5 @@ void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr);
 void mqtt_publish_result(uint32_t touch_time_ms,
                          const uint8_t touched[TOUCH_CHANNEL_COUNT],
                          float setpoint_c,
-                         const float temps_c[NTC_COUNT]);
+                         const float temps_max_c[NTC_COUNT],
+                         const float temps_avg_c[NTC_COUNT]);

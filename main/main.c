@@ -55,7 +55,7 @@ static const float s_ntc_offset_fixed[NTC_COUNT] = {
 
 /* ---------- Temperature setpoint controller ---------- */
 #define TEMP_SETPOINT_DEFAULT_C  43.0f  /* target skin-contact temperature, overridable via MQTT */
-#define TEMP_HYST_C               1.0f  /* hysteresis band half-width */
+#define TEMP_HYST_C               0.5f  /* hysteresis band half-width */
 #define TEMP_SAFETY_MARGIN_C      3.0f  /* NTC thermal lag compensation: heater turns OFF at (setpoint - margin)
                                            so real surface temperature stays at or below setpoint */
 #define TEMP_POLL_MS             200    /* NTC polling period inside pulse_task bang-bang loop */
@@ -162,10 +162,12 @@ static TaskHandle_t s_pulse_task;
 /* Per-channel enable mask, updated from MQTT, protected by s_setpoint_mutex */
 static bool s_channel_enabled[OUTPUT_COUNT] = {false, false, false};
 
-/* Shared temperature result written by pulse_task, read by app_main for MQTT publish */
+/* Shared temperature stats written by pulse_task, read by app_main for MQTT publish */
 static SemaphoreHandle_t s_temps_mutex;
 static float             s_temps_snapshot[NTC_COUNT];
 static float             s_temp_max[NTC_COUNT];
+static float             s_temp_sum[NTC_COUNT];
+static uint32_t          s_temp_count;
 
 static void pulse_task(void *arg)
 {
@@ -248,7 +250,9 @@ static void pulse_task(void *arg)
             for (int i = 0; i < NTC_COUNT; i++) {
                 s_temps_snapshot[i] = temps[i];
                 if (temps[i] > s_temp_max[i]) s_temp_max[i] = temps[i];
+                s_temp_sum[i] += temps[i];
             }
+            s_temp_count++;
             xSemaphoreGive(s_temps_mutex);
 
             vTaskDelay(pdMS_TO_TICKS(TEMP_POLL_MS));
@@ -467,7 +471,11 @@ void app_main(void)
             touch_start = esp_timer_get_time();
 
             xSemaphoreTake(s_temps_mutex, portMAX_DELAY);
-            for (int i = 0; i < NTC_COUNT; i++) s_temp_max[i] = s_temps_snapshot[i];
+            for (int i = 0; i < NTC_COUNT; i++) {
+                s_temp_max[i] = s_temps_snapshot[i];
+                s_temp_sum[i] = 0.0f;
+            }
+            s_temp_count = 0;
             xSemaphoreGive(s_temps_mutex);
 
             ESP_LOGI(TAG, "\033[32mALL ON — setpoint=%.1f °C\033[0m", s_setpoint_c);
@@ -492,15 +500,21 @@ void app_main(void)
             }
 
             float temp_max_snapshot[NTC_COUNT];
+            float temp_avg_snapshot[NTC_COUNT];
             xSemaphoreTake(s_temps_mutex, portMAX_DELAY);
             memcpy(temp_max_snapshot, s_temp_max, sizeof(s_temp_max));
+            for (int i = 0; i < NTC_COUNT; i++) {
+                temp_avg_snapshot[i] = s_temp_count > 0
+                    ? s_temp_sum[i] / (float)s_temp_count
+                    : s_temp_max[i];
+            }
             xSemaphoreGive(s_temps_mutex);
 
             xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
             float sp = s_setpoint_c;
             xSemaphoreGive(s_setpoint_mutex);
 
-            mqtt_publish_result(elapsed_ms, touched, sp, temp_max_snapshot);
+            mqtt_publish_result(elapsed_ms, touched, sp, temp_max_snapshot, temp_avg_snapshot);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");

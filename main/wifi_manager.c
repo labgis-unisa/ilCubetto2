@@ -7,7 +7,7 @@
 
 #define TAG "WIFI"
 
-#define WIFI_SSID      "ilCubetto"
+#define WIFI_SSID       "ilCubetto"
 #define WIFI_PASSWORD  "ilCubettoPassword"
 
 #define WIFI_CONNECTED_BIT BIT0

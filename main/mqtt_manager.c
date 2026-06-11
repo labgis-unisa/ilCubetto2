@@ -99,7 +99,8 @@ void mqtt_init(mqtt_cmd_t *cmd, void *cmd_mutex, bool *is_new_cmd_ptr)
 void mqtt_publish_result(uint32_t touch_time_ms,
                          const uint8_t  touched[TOUCH_CHANNEL_COUNT],
                          float setpoint_c,
-                         const float    temps_c[NTC_COUNT])
+                         const float    temps_max_c[NTC_COUNT],
+                         const float    temps_avg_c[NTC_COUNT])
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "touch_time_ms", touch_time_ms);
@@ -112,11 +113,17 @@ void mqtt_publish_result(uint32_t touch_time_ms,
 
     cJSON_AddNumberToObject(root, "temp_setpoint_c", roundf(setpoint_c * 10.0f) / 10.0f);
 
-    cJSON *jtemps = cJSON_CreateArray();
+    cJSON *jmax = cJSON_CreateArray();
     for (int i = 0; i < NTC_COUNT; i++) {
-        cJSON_AddItemToArray(jtemps, cJSON_CreateNumber(roundf(temps_c[i] * 10.0f) / 10.0f));
+        cJSON_AddItemToArray(jmax, cJSON_CreateNumber(roundf(temps_max_c[i] * 10.0f) / 10.0f));
     }
-    cJSON_AddItemToObject(root, "temps_c", jtemps);
+    cJSON_AddItemToObject(root, "temps_max_c", jmax);
+
+    cJSON *javg = cJSON_CreateArray();
+    for (int i = 0; i < NTC_COUNT; i++) {
+        cJSON_AddItemToArray(javg, cJSON_CreateNumber(roundf(temps_avg_c[i] * 10.0f) / 10.0f));
+    }
+    cJSON_AddItemToObject(root, "temps_avg_c", javg);
 
     char *out = cJSON_PrintUnformatted(root);
     if (out) {
