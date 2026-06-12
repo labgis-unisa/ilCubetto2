@@ -162,6 +162,9 @@ static TaskHandle_t s_pulse_task;
 /* Per-channel enable mask, updated from MQTT, protected by s_setpoint_mutex */
 static bool s_channel_enabled[OUTPUT_COUNT] = {false, false, false};
 
+/* Last channel mask received from a command message (never cleared at stop), protected by s_setpoint_mutex */
+static bool s_last_cmd_channels[OUTPUT_COUNT] = {false, false, false};
+
 /* Shared temperature stats written by pulse_task, read by app_main for MQTT publish */
 static SemaphoreHandle_t s_temps_mutex;
 static float             s_temps_snapshot[NTC_COUNT];
@@ -460,6 +463,7 @@ void app_main(void)
             xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
             s_setpoint_c = new_sp;
             memcpy(s_channel_enabled, new_en, sizeof(s_channel_enabled));
+            memcpy(s_last_cmd_channels, new_en, sizeof(s_last_cmd_channels));
             xSemaphoreGive(s_setpoint_mutex);
 
             ESP_LOGI(TAG, "Setpoint=%.1f °C  channels=[%d,%d,%d]",
@@ -512,9 +516,11 @@ void app_main(void)
 
             xSemaphoreTake(s_setpoint_mutex, portMAX_DELAY);
             float sp = s_setpoint_c;
+            bool ch_enabled_snapshot[OUTPUT_COUNT];
+            memcpy(ch_enabled_snapshot, s_last_cmd_channels, sizeof(ch_enabled_snapshot));
             xSemaphoreGive(s_setpoint_mutex);
 
-            mqtt_publish_result(elapsed_ms, touched, sp, temp_max_snapshot, temp_avg_snapshot);
+            mqtt_publish_result(elapsed_ms, touched, sp, ch_enabled_snapshot, temp_max_snapshot, temp_avg_snapshot);
         }
 
         ESP_LOGI(TAG, "\033[32m-------------\033[0m");

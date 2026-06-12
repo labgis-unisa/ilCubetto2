@@ -4,7 +4,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.port": "/dev/tty.usbmodem1101",
+  "idf.port": "/dev/tty.usbmodem2101",
   "idf.currentSetup": "/Users/piebat/esp/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -16,5 +16,5 @@
     "--compile-commands-dir=/Users/piebat/MyGoogleD/Publicazioni 2025/Sensors/code/articolo/heating/build"
   ],
   "idf.flashType": "UART",
-  "idf.monitorPort": "/dev/tty.usbmodem1101"
+  "idf.monitorPort": "/dev/tty.usbmodem2101"
 }
